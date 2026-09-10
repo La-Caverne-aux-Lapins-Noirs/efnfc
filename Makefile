@@ -16,7 +16,7 @@ PREFIX ?= /usr/local
 endif
 
 BINDIR ?= $(PREFIX)/bin
-SRC = efrits-nfc.c
+SRC = efnfc.c
 OBJ = $(SRC:.c=.o)
 
 .PHONY: all clean fclean re install
