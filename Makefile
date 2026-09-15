@@ -3,7 +3,7 @@ BASE_CFLAGS = -O2 -Wall -Wextra -Wpedantic -std=c11
 CFLAGS ?= $(BASE_CFLAGS)
 
 ifeq ($(OS),Windows_NT)
-NAME = efnfc.exe
+NAME = efrits-nfc.exe
 LDLIBS = -lwinscard
 PREFIX ?= $(if $(MINGW_PREFIX),$(MINGW_PREFIX),/ucrt64)
 else
@@ -16,7 +16,7 @@ PREFIX ?= /usr/local
 endif
 
 BINDIR ?= $(PREFIX)/bin
-SRC = efnfc.c
+SRC = efrits-nfc.c
 OBJ = $(SRC:.c=.o)
 
 .PHONY: all clean fclean re install
@@ -33,7 +33,7 @@ clean:
 	rm -f $(OBJ)
 
 fclean: clean
-	rm -f efnfc efnfc.exe
+	rm -f efnfc efnfc.exe efrits-nfc.exe
 
 re: fclean all
 

@@ -28,6 +28,13 @@
 #define EFRITS_NFC_FIRST_PAGE 4
 #define EFRITS_NFC_PAGE_SIZE 4
 #define EFRITS_NFC_PAGE_COUNT (EFRITS_NFC_FILE_SIZE / EFRITS_NFC_PAGE_SIZE)
+#define EFRITS_NFC_CARD_SETTLE_MS 150
+#define EFRITS_NFC_IO_RETRY_MS 60
+#define EFRITS_NFC_IO_RETRIES 4
+#define EFRITS_NFC_WRITE_SETTLE_MS 20
+#define EFRITS_NFC_VERIFY_SETTLE_MS 100
+#define EFRITS_NFC_SESSION_RETRIES 3
+#define EFRITS_NFC_SESSION_RETRY_MS 250
 
 static const unsigned char EFRITS_MAGIC[4] = {'E','F','R','1'};
 static const unsigned char EFRITS_TRAILER[4] = {'N','F','C','!'};
@@ -278,7 +285,16 @@ static int wait_for_card(SCARDCONTEXT ctx, const char *reader, SCARDHANDLE *card
                            SCARD_PROTOCOL_T0 | SCARD_PROTOCOL_T1,
                            card, protocol);
         if (rc == SCARD_S_SUCCESS)
+        {
+            /*
+             * ACR1552U/Windows can report the card as connectable a little
+             * before the PICC side is fully ready for the first APDU.  This
+             * happens especially when the program is already waiting and the
+             * user then places a card on the reader (the browser workflow).
+             */
+            sleep_ms(EFRITS_NFC_CARD_SETTLE_MS);
             return 1;
+        }
         if (rc != SCARD_E_NO_SMARTCARD && rc != SCARD_W_REMOVED_CARD)
         {
             fprintf(stderr, "Impossible de se connecter a la carte: 0x%08lX\n", (unsigned long)rc);
@@ -329,19 +345,27 @@ static int read_page(SCARDHANDLE card, DWORD protocol, unsigned char page,
                      unsigned char out[EFRITS_NFC_PAGE_SIZE])
 {
     unsigned char command[] = {0xFF, 0xB0, 0x00, page, EFRITS_NFC_PAGE_SIZE};
-    unsigned char response[32];
-    DWORD response_len = sizeof(response);
+    int attempt;
 
-    if (!transmit_apdu(card, protocol, command, sizeof(command), response, &response_len))
-        return 0;
-    if (response_len != EFRITS_NFC_PAGE_SIZE + 2)
+    for (attempt = 0; attempt < EFRITS_NFC_IO_RETRIES; ++attempt)
     {
-        fprintf(stderr, "Taille inattendue lors de la lecture de la page %u: %lu octets.\n",
-                (unsigned)page, (unsigned long)(response_len - 2));
-        return 0;
+        unsigned char response[32];
+        DWORD response_len = sizeof(response);
+
+        if (transmit_apdu(card, protocol, command, sizeof(command), response, &response_len))
+        {
+            if (response_len == EFRITS_NFC_PAGE_SIZE + 2)
+            {
+                memcpy(out, response, EFRITS_NFC_PAGE_SIZE);
+                return 1;
+            }
+            fprintf(stderr, "Taille inattendue lors de la lecture de la page %u: %lu octets.\n",
+                    (unsigned)page, (unsigned long)(response_len - 2));
+        }
+        if (attempt + 1 < EFRITS_NFC_IO_RETRIES)
+            sleep_ms(EFRITS_NFC_IO_RETRY_MS);
     }
-    memcpy(out, response, EFRITS_NFC_PAGE_SIZE);
-    return 1;
+    return 0;
 }
 
 static int write_page(SCARDHANDLE card, DWORD protocol, unsigned char page,
@@ -350,11 +374,25 @@ static int write_page(SCARDHANDLE card, DWORD protocol, unsigned char page,
     unsigned char command[5 + EFRITS_NFC_PAGE_SIZE] = {
         0xFF, 0xD6, 0x00, page, EFRITS_NFC_PAGE_SIZE, 0, 0, 0, 0
     };
-    unsigned char response[32];
-    DWORD response_len = sizeof(response);
+    int attempt;
 
     memcpy(command + 5, in, EFRITS_NFC_PAGE_SIZE);
-    return transmit_apdu(card, protocol, command, sizeof(command), response, &response_len);
+    for (attempt = 0; attempt < EFRITS_NFC_IO_RETRIES; ++attempt)
+    {
+        unsigned char response[32];
+        DWORD response_len = sizeof(response);
+
+        if (transmit_apdu(card, protocol, command, sizeof(command), response, &response_len))
+        {
+            /* Ultralight/Type-2 writes commit to EEPROM.  Give the tag a tiny
+             * amount of time before the next page or the read-back check. */
+            sleep_ms(EFRITS_NFC_WRITE_SETTLE_MS);
+            return 1;
+        }
+        if (attempt + 1 < EFRITS_NFC_IO_RETRIES)
+            sleep_ms(EFRITS_NFC_IO_RETRY_MS);
+    }
+    return 0;
 }
 
 static int read_payload(SCARDHANDLE card, DWORD protocol,
@@ -465,6 +503,10 @@ static int do_write(SCARDHANDLE card, DWORD protocol,
         }
     }
 
+    /* The final write may have succeeded before the reader/tag has finished
+     * settling.  The CLI used to report a false failure here even though a
+     * subsequent standalone read showed the freshly programmed payload. */
+    sleep_ms(EFRITS_NFC_VERIFY_SETTLE_MS);
     if (!read_payload(card, protocol, after))
     {
         fprintf(stderr, "Ecriture terminee mais relecture de verification impossible.\n");
@@ -530,23 +572,54 @@ int main(int argc, char **argv)
         goto cleanup;
     printf("Lecteur : %s\n", reader);
 
-    if (!wait_for_card(ctx, reader, &card, &protocol))
-        goto cleanup;
-
-    if (writing)
     {
-        unsigned char uid[32];
-        DWORD uid_len = sizeof(uid);
-        if (get_uid(card, protocol, uid, &uid_len))
+        int attempt;
+
+        for (attempt = 0; attempt < EFRITS_NFC_SESSION_RETRIES && !ok; ++attempt)
         {
-            printf("UID : ");
-            print_hex(uid, uid_len);
-            putchar('\n');
+            if (!wait_for_card(ctx, reader, &card, &protocol))
+                break;
+
+            if (writing)
+            {
+                unsigned char uid[32];
+                DWORD uid_len = sizeof(uid);
+                if (get_uid(card, protocol, uid, &uid_len))
+                {
+                    printf("UID : ");
+                    print_hex(uid, uid_len);
+                    putchar('\n');
+                }
+                ok = do_write(card, protocol, payload);
+            }
+            else
+                ok = do_read(card, protocol);
+
+            if (!ok && attempt + 1 < EFRITS_NFC_SESSION_RETRIES)
+            {
+                /*
+                 * Some ACR1552U/PICC failures poison the current PC/SC
+                 * session: retrying the same APDU on the same handle does not
+                 * recover, while a fresh CLI invocation immediately works.
+                 * Reproduce that recovery here by resetting and reconnecting
+                 * the card before retrying the complete operation.  A write
+                 * is idempotent for our 32-byte payload: if the first attempt
+                 * actually committed all pages but only its verification
+                 * failed, the next attempt notices that the expected payload
+                 * is already present and returns success.
+                 */
+                fprintf(stderr,
+                        "Operation NFC non confirmee; nouvelle tentative avec une nouvelle session PC/SC (%d/%d).\n",
+                        attempt + 2, EFRITS_NFC_SESSION_RETRIES);
+                fflush(stdout);
+                fflush(stderr);
+                SCardDisconnect(card, SCARD_RESET_CARD);
+                card = 0;
+                protocol = 0;
+                sleep_ms(EFRITS_NFC_SESSION_RETRY_MS);
+            }
         }
-        ok = do_write(card, protocol, payload);
     }
-    else
-        ok = do_read(card, protocol);
 
 cleanup:
     if (card)

@@ -20,6 +20,14 @@ case "$uname_s" in
         MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 \
             reg.exe add 'HKCU\Software\Microsoft\Windows\CurrentVersion\Run' \
             /v EFRITSNfcBridge /t REG_SZ /d "$command" /f >/dev/null
+
+        # make install replaces the executable on disk but Windows keeps an
+        # already running bridge in memory. Stop it explicitly so an upgrade
+        # cannot leave the browser connected to an older protocol version.
+        powershell.exe -NoProfile -Command \
+            "Get-Process efrits-nfc-bridge -ErrorAction SilentlyContinue | Stop-Process -Force" \
+            >/dev/null 2>&1 || true
+        sleep 1
         powershell.exe -NoProfile -WindowStyle Hidden -Command \
             "Start-Process -WindowStyle Hidden -FilePath '$host_win'" >/dev/null 2>&1 || true
         printf '%s\n' "Pont NFC installé au démarrage Windows: $host_win"

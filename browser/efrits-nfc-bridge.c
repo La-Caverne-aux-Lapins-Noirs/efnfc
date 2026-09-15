@@ -27,6 +27,7 @@
 #include <netinet/in.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <time.h>
 #define close_socket close
 #define popen_cmd popen
 #define pclose_cmd pclose
@@ -45,6 +46,9 @@ typedef int socket_handle;
 #define MAX_OUTPUT 16384
 #define NFC_SIZE 32
 #define ALLOWED_ORIGIN "https://intra.efrits.fr"
+#define BRIDGE_VERSION 5
+#define PROCESS_RETRIES 2
+#define PROCESS_RETRY_MS 350
 
 typedef struct s_http_request
 {
@@ -69,67 +73,72 @@ static int is_allowed_host(const char *host)
         || strcmp(host, "localhost:38421") == 0;
 }
 
-static void json_escape(FILE *out, const char *s)
+static char *json_result(int ok, int exit_code, const char *output)
 {
-    const unsigned char *p = (const unsigned char *)(s ? s : "");
+    static const char hexdigits[] = "0123456789abcdef";
+    const unsigned char *p = (const unsigned char *)(output ? output : "");
+    size_t input_len = strlen((const char *)p);
+    size_t capacity;
+    char *buffer;
+    char *out;
+    int n;
 
-    fputc('"', out);
+    /*
+     * Do not use tmpfile() here.  The bridge is normally launched from the
+     * Windows user startup environment; a temporary C stream is not guaranteed
+     * to be available there.  The old implementation returned NULL when
+     * tmpfile() failed, which made the HTTP layer fall back to {"ok":false} and
+     * discarded both the real exit code and efrits-nfc's output.
+     *
+     * Six bytes per input byte is the JSON worst case (\\u00XX), with ample
+     * room for the fixed object syntax and integer fields.
+     */
+    if (input_len > (((size_t)-1) - 256) / 6)
+        return NULL;
+    capacity = input_len * 6 + 256;
+    buffer = (char *)malloc(capacity);
+    if (!buffer)
+        return NULL;
+
+    n = snprintf(buffer, capacity,
+        "{\"ok\":%s,\"bridge_version\":%d,\"exit_code\":%d,\"output\":",
+        ok ? "true" : "false", BRIDGE_VERSION, exit_code);
+    if (n < 0 || (size_t)n >= capacity)
+    {
+        free(buffer);
+        return NULL;
+    }
+    out = buffer + (size_t)n;
+    *out++ = '"';
     while (*p)
     {
         switch (*p)
         {
-            case '\\': fputs("\\\\", out); break;
-            case '"': fputs("\\\"", out); break;
-            case '\b': fputs("\\b", out); break;
-            case '\f': fputs("\\f", out); break;
-            case '\n': fputs("\\n", out); break;
-            case '\r': fputs("\\r", out); break;
-            case '\t': fputs("\\t", out); break;
+            case '\\': *out++ = '\\'; *out++ = '\\'; break;
+            case '"':  *out++ = '\\'; *out++ = '"';  break;
+            case '\b': *out++ = '\\'; *out++ = 'b';  break;
+            case '\f': *out++ = '\\'; *out++ = 'f';  break;
+            case '\n': *out++ = '\\'; *out++ = 'n';  break;
+            case '\r': *out++ = '\\'; *out++ = 'r';  break;
+            case '\t': *out++ = '\\'; *out++ = 't';  break;
             default:
                 if (*p < 0x20)
-                    fprintf(out, "\\u%04x", (unsigned)*p);
+                {
+                    *out++ = '\\';
+                    *out++ = 'u';
+                    *out++ = '0';
+                    *out++ = '0';
+                    *out++ = hexdigits[(*p >> 4) & 0x0f];
+                    *out++ = hexdigits[*p & 0x0f];
+                }
                 else
-                    fputc(*p, out);
+                    *out++ = (char)*p;
         }
         ++p;
     }
-    fputc('"', out);
-}
-
-static char *json_result(int ok, int exit_code, const char *output)
-{
-    FILE *tmp;
-    long len;
-    char *buffer;
-
-    tmp = tmpfile();
-    if (!tmp)
-        return NULL;
-    fprintf(tmp, "{\"ok\":%s,\"exit_code\":%d,\"output\":", ok ? "true" : "false", exit_code);
-    json_escape(tmp, output ? output : "");
-    fputs("}", tmp);
-    fflush(tmp);
-    len = ftell(tmp);
-    if (len < 0 || len > 1024 * 1024)
-    {
-        fclose(tmp);
-        return NULL;
-    }
-    rewind(tmp);
-    buffer = (char *)malloc((size_t)len + 1);
-    if (!buffer)
-    {
-        fclose(tmp);
-        return NULL;
-    }
-    if (fread(buffer, 1, (size_t)len, tmp) != (size_t)len)
-    {
-        free(buffer);
-        fclose(tmp);
-        return NULL;
-    }
-    buffer[len] = 0;
-    fclose(tmp);
+    *out++ = '"';
+    *out++ = '}';
+    *out = 0;
     return buffer;
 }
 
@@ -520,15 +529,140 @@ static void remove_temp(const char *path)
 #endif
 }
 
+#ifdef _WIN32
+static int run_cli_windows(const char *cli, const char *nfc_path, char *output, size_t output_size)
+{
+    SECURITY_ATTRIBUTES sa;
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    HANDLE pipe_read = NULL;
+    HANDLE pipe_write = NULL;
+    HANDLE nul_input = INVALID_HANDLE_VALUE;
+    char command[9000];
+    DWORD exit_code = 1;
+    size_t used = 0;
+    BOOL created;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+
+    if (!CreatePipe(&pipe_read, &pipe_write, &sa, 0))
+    {
+        snprintf(output, output_size, "Impossible de creer le canal de sortie pour efrits-nfc (Win32=%lu).",
+                 (unsigned long)GetLastError());
+        return -1;
+    }
+    if (!SetHandleInformation(pipe_read, HANDLE_FLAG_INHERIT, 0))
+    {
+        snprintf(output, output_size, "Impossible de configurer le canal de sortie pour efrits-nfc (Win32=%lu).",
+                 (unsigned long)GetLastError());
+        CloseHandle(pipe_read);
+        CloseHandle(pipe_write);
+        return -1;
+    }
+
+    nul_input = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (nul_input == INVALID_HANDLE_VALUE)
+    {
+        snprintf(output, output_size, "Impossible d'ouvrir NUL pour efrits-nfc (Win32=%lu).",
+                 (unsigned long)GetLastError());
+        CloseHandle(pipe_read);
+        CloseHandle(pipe_write);
+        return -1;
+    }
+
+    memset(&si, 0, sizeof(si));
+    memset(&pi, 0, sizeof(pi));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = nul_input;
+    si.hStdOutput = pipe_write;
+    si.hStdError = pipe_write;
+
+    if (nfc_path)
+        snprintf(command, sizeof(command), "\"%s\" \"%s\"", cli, nfc_path);
+    else
+        snprintf(command, sizeof(command), "\"%s\"", cli);
+
+    created = CreateProcessA(
+        cli,
+        command,
+        NULL,
+        NULL,
+        TRUE,
+        CREATE_NO_WINDOW,
+        NULL,
+        NULL,
+        &si,
+        &pi
+    );
+
+    CloseHandle(pipe_write);
+    pipe_write = NULL;
+    CloseHandle(nul_input);
+    nul_input = INVALID_HANDLE_VALUE;
+
+    if (!created)
+    {
+        snprintf(output, output_size, "Impossible de lancer %s (Win32=%lu).",
+                 cli, (unsigned long)GetLastError());
+        CloseHandle(pipe_read);
+        return -1;
+    }
+
+    while (used + 1 < output_size)
+    {
+        DWORD got = 0;
+        DWORD room = (DWORD)(output_size - used - 1);
+
+        if (!ReadFile(pipe_read, output + used, room, &got, NULL) || got == 0)
+            break;
+        used += (size_t)got;
+    }
+    output[used] = 0;
+    CloseHandle(pipe_read);
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    if (!GetExitCodeProcess(pi.hProcess, &exit_code))
+        exit_code = 1;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    if (exit_code != 0)
+    {
+        size_t i;
+        int only_space = 1;
+
+        for (i = 0; i < used; ++i)
+            if (!isspace((unsigned char)output[i]))
+            {
+                only_space = 0;
+                break;
+            }
+        if (used == 0 || only_space)
+            snprintf(output, output_size,
+                     "efrits-nfc a quitte avec le code %lu sans produire de diagnostic. Binaire: %s",
+                     (unsigned long)exit_code, cli);
+    }
+    return (int)exit_code;
+}
+#endif
+
 static int run_cli(const char *nfc_path, char *output, size_t output_size)
 {
     char cli[4096];
+
+    find_cli(cli, sizeof(cli));
+#ifdef _WIN32
+    return run_cli_windows(cli, nfc_path, output, output_size);
+#else
     char command[9000];
     FILE *pipe;
     size_t used = 0;
     int status;
 
-    find_cli(cli, sizeof(cli));
     if (nfc_path)
         snprintf(command, sizeof(command), "\"%s\" \"%s\" 2>&1", cli, nfc_path);
     else
@@ -549,9 +683,6 @@ static int run_cli(const char *nfc_path, char *output, size_t output_size)
     }
     output[used] = 0;
     status = pclose_cmd(pipe);
-#ifdef _WIN32
-    return status;
-#else
     if (status == -1)
         return -1;
     if (WIFEXITED(status))
@@ -560,10 +691,77 @@ static int run_cli(const char *nfc_path, char *output, size_t output_size)
 #endif
 }
 
+static void bridge_sleep_ms(unsigned long milliseconds)
+{
+#ifdef _WIN32
+    Sleep((DWORD)milliseconds);
+#else
+    struct timespec req;
+    struct timespec rem;
+
+    req.tv_sec = (time_t)(milliseconds / 1000UL);
+    req.tv_nsec = (long)((milliseconds % 1000UL) * 1000000UL);
+    while (nanosleep(&req, &rem) != 0 && errno == EINTR)
+        req = rem;
+#endif
+}
+
+static void append_diagnostic(char *output, size_t output_size, size_t *used,
+                              int attempt, int code, const char *attempt_output)
+{
+    int n;
+    const char *text = attempt_output && *attempt_output
+        ? attempt_output : "(aucune sortie produite par efrits-nfc)\n";
+
+    if (*used >= output_size - 1)
+        return;
+    n = snprintf(output + *used, output_size - *used,
+                 "%sTentative processus %d/%d — code de sortie %d\n%s",
+                 *used ? "\n" : "", attempt, PROCESS_RETRIES, code, text);
+    if (n < 0)
+        return;
+    if ((size_t)n >= output_size - *used)
+        *used = output_size - 1;
+    else
+        *used += (size_t)n;
+}
+
+/*
+ * A fresh child process is intentional here.  The ACR1552U can leave the
+ * PC/SC context of one efrits-nfc invocation in a state where the write has
+ * actually reached the tag but the verification fails.  Re-running inside
+ * the same process/context was not sufficient on the Windows station; a
+ * subsequent standalone CLI invocation was.  The bridge therefore reproduces
+ * that exact recovery: terminate the first CLI, wait briefly, then spawn a
+ * completely fresh efrits-nfc process.
+ */
+static int run_cli_with_process_retry(const char *nfc_path,
+                                      char *output, size_t output_size)
+{
+    char attempt_output[MAX_OUTPUT];
+    size_t used = 0;
+    int attempt;
+    int code = 1;
+
+    output[0] = 0;
+    for (attempt = 1; attempt <= PROCESS_RETRIES; ++attempt)
+    {
+        attempt_output[0] = 0;
+        code = run_cli(nfc_path, attempt_output, sizeof(attempt_output));
+        append_diagnostic(output, output_size, &used, attempt, code, attempt_output);
+        output[used < output_size ? used : output_size - 1] = 0;
+        if (code == 0)
+            return 0;
+        if (attempt < PROCESS_RETRIES)
+            bridge_sleep_ms(PROCESS_RETRY_MS);
+    }
+    return code;
+}
+
 static char *handle_read(void)
 {
     char output[MAX_OUTPUT];
-    int code = run_cli(NULL, output, sizeof(output));
+    int code = run_cli_with_process_retry(NULL, output, sizeof(output));
     return json_result(code == 0, code, output);
 }
 
@@ -583,7 +781,7 @@ static char *handle_write(const char *body)
     if (!make_temp_nfc(payload, payload_len, temp_path, sizeof(temp_path)))
         return json_error("Impossible de créer le fichier NFC temporaire.");
 
-    code = run_cli(temp_path, output, sizeof(output));
+    code = run_cli_with_process_retry(temp_path, output, sizeof(output));
     remove_temp(temp_path);
     return json_result(code == 0, code, output);
 }
@@ -619,17 +817,17 @@ static void handle_client(socket_handle fd)
 
     if (!parse_request(buffer, used, &req))
     {
-        send_response(fd, 400, "Bad Request", "null", "application/json; charset=utf-8", "{\"ok\":false,\"output\":\"Requête invalide.\"}");
+        send_response(fd, 400, "Bad Request", "null", "application/json; charset=utf-8", "{\"ok\":false,\"bridge_version\":5,\"exit_code\":-1,\"output\":\"Requête invalide.\"}");
         return;
     }
     if (!is_allowed_host(req.host))
     {
-        send_response(fd, 403, "Forbidden", "null", "application/json; charset=utf-8", "{\"ok\":false,\"output\":\"Host refusé.\"}");
+        send_response(fd, 403, "Forbidden", "null", "application/json; charset=utf-8", "{\"ok\":false,\"bridge_version\":5,\"exit_code\":-1,\"output\":\"Host refusé.\"}");
         return;
     }
     if (!is_allowed_origin(req.origin))
     {
-        send_response(fd, 403, "Forbidden", "null", "application/json; charset=utf-8", "{\"ok\":false,\"output\":\"Origine refusée.\"}");
+        send_response(fd, 403, "Forbidden", "null", "application/json; charset=utf-8", "{\"ok\":false,\"bridge_version\":5,\"exit_code\":-1,\"output\":\"Origine refusée.\"}");
         return;
     }
 
@@ -641,7 +839,7 @@ static void handle_client(socket_handle fd)
     if (strcmp(req.path, "/v1/ping") == 0 && strcmp(req.method, "GET") == 0)
     {
         send_response(fd, 200, "OK", req.origin, "application/json; charset=utf-8",
-                      "{\"ok\":true,\"version\":1,\"tool\":\"efrits-nfc\"}");
+                      "{\"ok\":true,\"version\":5,\"tool\":\"efrits-nfc\"}");
         return;
     }
     if (strcmp(req.path, "/v1/read") == 0 && strcmp(req.method, "POST") == 0)
@@ -650,13 +848,13 @@ static void handle_client(socket_handle fd)
         response = handle_write(req.body);
     else
     {
-        send_response(fd, 404, "Not Found", req.origin, "application/json; charset=utf-8", "{\"ok\":false,\"output\":\"Action inconnue.\"}");
+        send_response(fd, 404, "Not Found", req.origin, "application/json; charset=utf-8", "{\"ok\":false,\"bridge_version\":5,\"exit_code\":-1,\"output\":\"Action inconnue.\"}");
         return;
     }
 
     if (!response)
         response = json_error("Erreur interne du pont NFC.");
-    send_response(fd, 200, "OK", req.origin, "application/json; charset=utf-8", response ? response : "{\"ok\":false}");
+    send_response(fd, 200, "OK", req.origin, "application/json; charset=utf-8", response ? response : "{\"ok\":false,\"bridge_version\":5,\"exit_code\":-1,\"output\":\"Erreur interne du pont NFC.\"}");
     free(response);
 }
 
